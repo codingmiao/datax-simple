@@ -14,14 +14,17 @@ import com.alibaba.datax.core.util.ExceptionTracker;
 import com.alibaba.datax.core.util.FrameworkErrorCode;
 import com.alibaba.datax.core.util.container.CoreConstant;
 import com.alibaba.datax.core.util.container.LoadUtil;
-import org.apache.commons.cli.BasicParser;
 import org.apache.commons.cli.Options;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.wowtools.common.utils.AsyncTaskUtil;
 import org.wowtools.common.utils.ResourcesReader;
 
-import java.util.Set;
+import java.io.File;
+import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -116,6 +119,8 @@ public class Engine {
     }
 
     public static void entry(String jobPath) throws Throwable {
+        LOG.info("执行配置文件任务:{}", jobPath);
+
         Options options = new Options();
         options.addOption("job", true, "Job config.");
         options.addOption("jobid", true, "Job unique id.");
@@ -143,35 +148,144 @@ public class Engine {
     }
 
 
-    public static void main(String[] args) throws Exception {
-        String[] taskJsons = ResourcesReader.readStr(Engine.class, "/datax/tasks.txt").split("\n");
+    public static void main(String[] args) {
+        boolean success = execute();
+        System.exit(success ? 0 : 1);
+    }
 
-        int exitCode = 0;
-        try {
-            for (String taskJson : taskJsons) {
-                if(StringUtils.isBlank(taskJson)){
+    private static boolean execute() {
+        boolean success = true;
+        Config config = parseTasks();
+        for (List<String> task : config.taskJsons) {
+            for (String jobPath : task) {
+                try {
+                    entry(jobPath);
+                } catch (Throwable throwable) {
+                    success = false;
+                    err(throwable);
+                    break;
+                }
+            }
+            if (!success) {
+                return false;
+            }
+        }
+        LOG.info("datax执行完成");
+        return true;
+    }
+
+    private static void err(Throwable e) {
+        LOG.error("\n\n经DataX智能分析,该任务最可能的错误原因是:\n" + ExceptionTracker.trace(e));
+
+        if (e instanceof DataXException) {
+            DataXException tempException = (DataXException) e;
+            ErrorCode errorCode = tempException.getErrorCode();
+            if (errorCode instanceof FrameworkErrorCode) {
+                FrameworkErrorCode tempErrorCode = (FrameworkErrorCode) errorCode;
+            }
+        }
+    }
+
+    private static Config parseTasks() {
+        String[] rows = ResourcesReader.readStr(Engine.class, "/datax/tasks.md").split("\n");
+        for (int i = 0; i < rows.length; i++) {
+            rows[i] = rows[i].trim();
+        }
+        Config config = parseConfig(rows);
+
+        List<List<String>> tasks = new LinkedList<>();
+        List<String> threadTasks = null;
+        boolean inTask = false;
+        for (int i = config.configEnd + 1; i < rows.length; i++) {
+            String row = rows[i];
+            if (StringUtils.isBlank(row)) {//空行
+                continue;
+            }
+            if (row.charAt(0) == '#') {//注释
+                continue;
+            }
+            row = row.trim();
+            if ("```".equals(row)) {//进出代码块
+                if (inTask) {//即将离开代码块
+                    tasks.add(threadTasks);
+                } else {//即将进入代码块
+                    threadTasks = new LinkedList<>();
+                }
+                inTask = !inTask;
+                continue;
+            }
+            if (inTask) {//在代码块内则添加
+                String path;
+                if (row.charAt(0) == '<') {
+                    int e = row.indexOf(">") + 1;
+                    String pathHeadKey = row.substring(0, e);
+                    String pathHead = config.pathHeads.get(pathHeadKey);
+                    if (null == pathHead) {
+                        throw new RuntimeException("相对路径 " + pathHeadKey + " 未指定:" + row);
+                    }
+                    path = pathHead + File.separator + row.substring(e);
+                } else {
+                    path = row;
+                }
+                threadTasks.add(path);
+            }
+        }
+        config.taskJsons = tasks;
+        return config;
+    }
+
+    private static Config parseConfig(String[] rows) {
+        Config config = new Config();
+        for (int i = 0; i < rows.length; i++) {
+            if ("end config".equals(rows[i])) {
+                config.configEnd = i;
+            }
+        }
+        if (config.configEnd > 0) {
+            HashSet<String> seted = new HashSet<>();//重复配置检查
+            HashSet<String> pathheads = new HashSet<>();
+            for (int i = 0; i < config.configEnd; i++) {
+                String row = rows[i];
+                if (StringUtils.isBlank(row)) {//空行
                     continue;
                 }
-                taskJson = taskJson.trim();
-                LOG.info("执行配置文件任务:{}",taskJson);
-                entry(taskJson);
-            }
-        } catch (Throwable e) {
-            exitCode = 1;
-            LOG.error("\n\n经DataX智能分析,该任务最可能的错误原因是:\n" + ExceptionTracker.trace(e));
-
-            if (e instanceof DataXException) {
-                DataXException tempException = (DataXException) e;
-                ErrorCode errorCode = tempException.getErrorCode();
-                if (errorCode instanceof FrameworkErrorCode) {
-                    FrameworkErrorCode tempErrorCode = (FrameworkErrorCode) errorCode;
-                    exitCode = tempErrorCode.toExitValue();
+                if (row.charAt(0) == '#') {//注释
+                    continue;
                 }
-            }
+                String[] cfg = row.split("=", 2);
+                if (2 != cfg.length) {
+                    continue;
+                }
+                String key = cfg[0].trim();
+                if (!seted.add(key)) {
+                    throw new RuntimeException("重复的配置项:" + key);
+                }
+                String value = cfg[1].trim();
+                switch (key) {
+                    case "pathhead":
+                        String[] heads = value.split(",");
+                        for (String head : heads) {
+                            pathheads.add(head);
+                        }
+                        break;
+                    default:
+                        if (pathheads.contains(key)) {
+                            config.pathHeads.put("<" + key + ">", value);
+                        } else {
+                            throw new RuntimeException("无效的配置项:" + key);
+                        }
 
-            System.exit(exitCode);
+                }
+
+            }
         }
-        System.exit(exitCode);
+        return config;
+    }
+
+    private static final class Config {
+        private HashMap<String, String> pathHeads = new HashMap<>();//相对路径头
+        private int configEnd = -1;//配置结束于第几行
+        private List<List<String>> taskJsons;
     }
 
 }

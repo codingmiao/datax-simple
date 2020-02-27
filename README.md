@@ -117,7 +117,7 @@ core/src/main/resources/datax/plugin
 
 ## 2、运行
 先按照datax的编写规范，编写几个job json，然后把json的路径分行写入
-``\core\src\main\resources\datax\tasks.txt``
+``\core\src\main\resources\datax\tasks.md``
 
 运行com.alibaba.datax.core.Engine类即可~
 o(*￣︶￣*)o
